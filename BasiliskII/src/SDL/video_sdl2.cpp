@@ -210,6 +210,7 @@ static int present_sdl_video();
 #include <GLES3/gl3.h>
 #include <jni.h>
 #include <map>
+#include <mutex>
 #include <android/log.h>
 #define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "CarmenSS", __VA_ARGS__)
 #include <pthread.h>
@@ -241,23 +242,52 @@ __attribute__((constructor)) static void stdout_to_log()
 	pthread_detach(t);
 }
 
-static volatile int upscale_filter = 0;
-extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *, jclass, jint f)
+// The passes to draw with, "shader:options ..." (the APK's web/shaders/filters.txt
+// describes them; the app's Upscaler.java picks and expands them).
+static std::mutex upscale_lock;
+static std::string upscale_spec = "sharp-bilinear.glsl:linear";
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
 {
-	upscale_filter = f;
+	const char *c = env->GetStringUTFChars(spec, NULL);
+	std::lock_guard<std::mutex> g(upscale_lock);
+	upscale_spec = c;
+	env->ReleaseStringUTFChars(spec, c);
 }
 
-struct UpscalePass { const char *file; bool nearest; };
-static const UpscalePass upscale_filters[4][3] = {
-	{{"sharp-bilinear.glsl", false}},
-	{{"xbr-lv2.glsl", true}},
-	{{"fsr-pass0.glsl", false}, {"fsr-pass1.glsl", false}},
-	{{"plain.glsl", false}},
-};
+struct UpscalePass { std::string file; bool nearest, half; int mult; };
+static std::vector<UpscalePass> upscale_chain;
+static std::string upscale_parsed;
+
+static void upscale_parse(const std::string &spec)
+{
+	upscale_chain.clear();
+	size_t i = 0;
+	while (i < spec.size()) {
+		while (i < spec.size() && spec[i] == ' ') i++;
+		size_t e = spec.find(' ', i);
+		if (e == std::string::npos) e = spec.size();
+		if (e > i) {
+			std::string tok = spec.substr(i, e - i), opts;
+			size_t c = tok.find(':');
+			UpscalePass p = {tok.substr(0, c), false, false, 0};
+			if (c != std::string::npos) opts = "," + tok.substr(c + 1) + ",";
+			p.nearest = opts.find(",nearest,") != std::string::npos;
+			p.half = opts.find(",float,") != std::string::npos;
+			for (int m = 1; m <= 9; m++)
+				if (opts.find(",x" + std::to_string(m) + ",") != std::string::npos) p.mult = m;
+			upscale_chain.push_back(p);
+		}
+		i = e;
+	}
+	upscale_parsed = spec;
+	upscale_log("[upscale] passes: %s", spec.c_str());
+}
+
 static std::map<std::string, GLuint> upscale_programs;
-static GLuint upscale_vbo, upscale_fbo, upscale_tex[2];
-static int upscale_tex_w[2], upscale_tex_h[2];
-static bool upscale_failed;
+struct UpscaleTarget { GLuint tex; int w, h; bool half; };
+static std::vector<UpscaleTarget> upscale_targets;	// 0: the Mac's screen upright, k + 1: what pass k drew
+static GLuint upscale_vbo, upscale_fbo;
+static bool upscale_failed, upscale_half_ok = true;
 static int upscale_generation;		// raised whenever the renderer (and so the GL context) is made
 
 static GLuint upscale_compile(const std::string &src, GLenum stage, const char *defs)
@@ -269,6 +299,9 @@ static GLuint upscale_compile(const std::string &src, GLenum stage, const char *
 	// libretro's "#pragma parameter" lines carry quoted names, which Mali's compiler refuses.
 	for (size_t at; (at = body.find("#pragma parameter")) != std::string::npos; )
 		body.replace(at, 7, "//");
+	// Its shaders ask for mediump on GL ES, too coarse for texel offsets at these sizes.
+	for (size_t at = 0; (at = body.find("mediump", at)) != std::string::npos; at += 5)
+		body.replace(at, 7, "highp");
 	text += body;
 	GLuint sh = glCreateShader(stage);
 	const char *c = text.c_str();
@@ -317,42 +350,90 @@ static GLuint upscale_program(const char *file, const char *defs)
 	return p;
 }
 
-// A texture to draw into, kept between frames (0: the Mac's screen size, 1: the letterbox's).
-static GLuint upscale_target(int i, int w, int h)
+// Target i at w x h, bound as the framebuffer to draw into (a half-float one if
+// asked for and the GPU can draw into it); kept between frames.
+static UpscaleTarget &upscale_target(size_t i, int w, int h, bool half)
 {
-	if (!upscale_tex[i]) glGenTextures(1, &upscale_tex[i]);
-	glBindTexture(GL_TEXTURE_2D, upscale_tex[i]);
-	if (upscale_tex_w[i] != w || upscale_tex_h[i] != h) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	while (upscale_targets.size() <= i) {
+		UpscaleTarget t = {0, 0, 0, false};
+		glGenTextures(1, &t.tex);
+		upscale_targets.push_back(t);
+	}
+	UpscaleTarget &t = upscale_targets[i];
+	half = half && upscale_half_ok;
+	glBindTexture(GL_TEXTURE_2D, t.tex);
+	if (t.w != w || t.h != h || t.half != half) {
+		if (half) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
+		else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		upscale_tex_w[i] = w; upscale_tex_h[i] = h;
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		t.w = w; t.h = h; t.half = half;
 	}
-	return upscale_tex[i];
+	glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+	if (half && glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		upscale_log("[upscale] no half-float targets here; eight bits instead");
+		upscale_half_ok = false;
+		t.w = 0;
+		return upscale_target(i, w, h, false);
+	}
+	glViewport(0, 0, w, h);
+	return t;
 }
 
-// One pass: program p reads texture src (sw x sh) into the bound framebuffer's viewport (ow x oh).
-static void upscale_draw(GLuint p, GLuint src, bool nearest, int sw, int sh, int ow, int oh)
+// Binds texture t (w x h) to a unit as the libretro uniforms <name>Texture, <name>TextureSize, <name>InputSize.
+static void upscale_bind(GLuint p, int unit, GLuint t, int w, int h, const std::string &name)
 {
-	static const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-	glUseProgram(p);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, src);
-	GLint f = nearest ? GL_NEAREST : GL_LINEAR;
+	glActiveTexture(GL_TEXTURE0 + unit);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glUniform1i(glGetUniformLocation(p, (name + "Texture").c_str()), unit);
+	glUniform2f(glGetUniformLocation(p, (name + "TextureSize").c_str()), w, h);
+	glUniform2f(glGetUniformLocation(p, (name + "InputSize").c_str()), w, h);
+}
+
+static void upscale_sampling(GLint f)
+{
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
-	glUniformMatrix4fv(glGetUniformLocation(p, "MVPMatrix"), 1, GL_FALSE, id);
-	glUniform2f(glGetUniformLocation(p, "TextureSize"), sw, sh);
-	glUniform2f(glGetUniformLocation(p, "InputSize"), sw, sh);
-	glUniform2f(glGetUniformLocation(p, "OutputSize"), ow, oh);
-	glUniform1i(glGetUniformLocation(p, "Texture"), 0);
-	glUniform1i(glGetUniformLocation(p, "decal"), 0);
-	glUniform1i(glGetUniformLocation(p, "FrameCount"), 0);
-	glUniform1i(glGetUniformLocation(p, "FrameDirection"), 1);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-// Draws texture (w x h) through the current filter; false if it could not (then SDL draws it).
+static void upscale_uniforms(GLuint p, int ow, int oh)
+{
+	static const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+	glUniformMatrix4fv(glGetUniformLocation(p, "MVPMatrix"), 1, GL_FALSE, id);
+	glUniform2f(glGetUniformLocation(p, "OutputSize"), ow, oh);
+	glUniform1i(glGetUniformLocation(p, "FrameCount"), 0);
+	glUniform1i(glGetUniformLocation(p, "FrameDirection"), 1);
+}
+
+// Draws texture (w x h) through the passes; false if it could not (then SDL draws it).
+static int upscale_trace;	// frames left to trace step by step after a change of passes
+
+// The GL state SDL's renderer keeps track of, put back as it was after the passes.
+struct UpscaleSaved {
+	GLint program, array_buffer, active, tex[4], fb, viewport[4], attrib[3];
+	void save() {
+		glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex[i]); }
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+		glGetIntegerv(GL_VIEWPORT, viewport);
+		for (int i = 0; i < 3; i++) glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &attrib[i]);
+	}
+	void restore() {
+		for (int i = 7; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, i < 4 ? tex[i] : 0); }
+		glActiveTexture(active);
+		glBindFramebuffer(GL_FRAMEBUFFER, fb);
+		glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+		glUseProgram(program);
+		glBindBuffer(GL_ARRAY_BUFFER, array_buffer);
+		for (int i = 0; i < 3; i++) { if (attrib[i]) glEnableVertexAttribArray(i); else glDisableVertexAttribArray(i); }
+	}
+};
+
 static bool upscale_present(SDL_Texture *texture, int w, int h)
 {
 	// A new video mode brings a new renderer and GL context (perhaps at the
@@ -361,21 +442,52 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 	if (upscale_generation != generation) {
 		generation = upscale_generation;
 		upscale_programs.clear();
+		upscale_targets.clear();
 		upscale_vbo = upscale_fbo = 0;
-		upscale_tex[0] = upscale_tex[1] = 0;
-		upscale_tex_w[0] = upscale_tex_w[1] = upscale_tex_h[0] = upscale_tex_h[1] = 0;
 		upscale_failed = false;
 		upscale_log("[upscale] new GL context");
 	}
 	if (upscale_failed) return false;
+	// Every shader filters.txt names is compiled with the first frame, so a
+	// change of filter never stops this thread (the Mac's own) to compile.
+	static int precompiled = -1;
+	if (precompiled != generation) {
+		precompiled = generation;
+		SDL_RWops *rw = SDL_RWFromFile("web/shaders/filters.txt", "rb");
+		std::string list;
+		if (rw) {
+			Sint64 n = SDL_RWsize(rw);
+			list.assign(n > 0 ? n : 0, '\0');
+			SDL_RWread(rw, &list[0], 1, list.size());
+			SDL_RWclose(rw);
+		}
+		Uint32 t0 = SDL_GetTicks();
+		int count = 0;
+		for (size_t at = 0; (at = list.find(".glsl", at)) != std::string::npos; at += 5) {
+			size_t b = list.find_last_of(" |\n", at);
+			std::string file = list.substr(b == std::string::npos ? 0 : b + 1, at + 5 - (b == std::string::npos ? 0 : b + 1));
+			if (upscale_programs.find(file) == upscale_programs.end()) { upscale_program(file.c_str(), ""); count++; }
+		}
+		upscale_log("[upscale] %d shaders compiled in %u ms", count, SDL_GetTicks() - t0);
+	}
+	{
+		std::lock_guard<std::mutex> g(upscale_lock);
+		if (upscale_spec != upscale_parsed) { upscale_parse(upscale_spec); upscale_trace = 2; }
+	}
+#define UPSCALE_STEP(...) do { if (upscale_trace) { upscale_log("[upscale] step: " __VA_ARGS__); glFinish(); upscale_log("[upscale] (finished)"); } } while (0)
+	if (upscale_trace) upscale_log("[upscale] step: start of frame");
 	SDL_RenderFlush(sdl_renderer);
+	if (upscale_trace) upscale_log("[upscale] step: SDL flushed");
+	UpscaleSaved saved;
+	saved.save();
+	if (upscale_trace) upscale_log("[upscale] step: state saved");
+	struct Restore { UpscaleSaved &s; ~Restore() { s.restore(); } } restore_on_return = {saved};
 	static int frames;
 	if (!frames++) upscale_log("[upscale] %s, GLSL %s", glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
 	int dw, dh;
 	if (SDL_GetRendererOutputSize(sdl_renderer, &dw, &dh) != 0) return false;
 	float s = fminf(dw / (float)w, dh / (float)h);
 	int vw = lroundf(w * s), vh = lroundf(h * s), vx = (dw - vw) / 2, vy = (dh - vh) / 2;
-	int f = upscale_filter & 3;
 	GLuint copy = upscale_program("plain.glsl", "#define FLIP\n");
 	if (!copy) { upscale_failed = true; return false; }
 
@@ -396,42 +508,67 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 	glDisable(GL_BLEND);
 	glDisable(GL_SCISSOR_TEST);
 
-	// SDL's texture, upright, into a texture of the Mac's size.
+	// SDL's texture, upright, into a texture of the Mac's size: OrigTexture to the passes.
+	UpscaleTarget orig = upscale_target(0, w, h, false);
+	if (upscale_trace) upscale_log("[upscale] step: target 0");
+	glUseProgram(copy);
 	glActiveTexture(GL_TEXTURE0);
 	if (SDL_GL_BindTexture(texture, NULL, NULL) != 0) { upscale_failed = true; return false; }
+	if (upscale_trace) upscale_log("[upscale] step: SDL texture bound");
 	GLint sdl_tex = 0;
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &sdl_tex);
-	GLuint src = upscale_target(0, w, h);
-	glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
-	glViewport(0, 0, w, h);
-	upscale_draw(copy, sdl_tex, true, w, h, w, h);
+	upscale_bind(copy, 0, sdl_tex, w, h, "");
+	upscale_sampling(GL_NEAREST);
+	upscale_uniforms(copy, w, h);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	SDL_GL_UnbindTexture(texture);
+	UPSCALE_STEP("copied, GL error 0x%x", glGetError());
 
-	int sw = w, sh = h;
-	for (int i = 0; i < 3 && upscale_filters[f][i].file; i++) {
-		const UpscalePass &pass = upscale_filters[f][i];
-		GLuint p = upscale_program(pass.file, "");
+	std::vector<UpscaleTarget> outs(1, orig);
+	for (size_t k = 0; k < upscale_chain.size(); k++) {
+		const UpscalePass &pass = upscale_chain[k];
+		GLuint p = upscale_program(pass.file.c_str(), "");
 		if (!p) { upscale_failed = true; break; }
-		bool last = i == 2 || !upscale_filters[f][i + 1].file;
-		GLuint dst = 0;
+		UpscaleTarget in = outs[k];
+		bool last = k + 1 == upscale_chain.size();
+		int ow = last || !pass.mult ? vw : in.w * pass.mult, oh = last || !pass.mult ? vh : in.h * pass.mult;
+		UpscaleTarget out = {0, ow, oh, false};
 		if (last) {
 			glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
 			glViewport(vx, vy, vw, vh);
 		} else {
-			dst = upscale_target(1, vw, vh);
-			glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
-			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst, 0);
-			glViewport(0, 0, vw, vh);
+			out = upscale_target(k + 1, ow, oh, pass.half);
 		}
-		upscale_draw(p, src, pass.nearest, sw, sh, vw, vh);
-		src = dst; sw = vw; sh = vh;
+		glUseProgram(p);
+		upscale_bind(p, 0, in.tex, in.w, in.h, "");
+		upscale_sampling(pass.nearest ? GL_NEAREST : GL_LINEAR);
+		glUniform1i(glGetUniformLocation(p, "decal"), 0);
+		upscale_bind(p, 1, orig.tex, orig.w, orig.h, "Orig");
+		for (size_t n = 2; n <= k + 1 && n < 8; n++) {
+			const UpscaleTarget &t = outs[k + 1 - n];
+			upscale_bind(p, n, t.tex, t.w, t.h, "PassPrev" + std::to_string(n));
+		}
+		upscale_uniforms(p, ow, oh);
+		UPSCALE_STEP("pass %d (%s) %dx%d from %dx%d, set up, GL error 0x%x", (int)k, pass.file.c_str(), ow, oh, in.w, in.h, glGetError());
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		UPSCALE_STEP("pass %d drawn, GL error 0x%x", (int)k, glGetError());
+		// The input's sampling back to nearest, for passes that read it as a PassPrev.
+		glActiveTexture(GL_TEXTURE0);
+		upscale_sampling(GL_NEAREST);
+		outs.push_back(out);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
-	glUseProgram(0);
+	if (upscale_trace) upscale_trace--;
+	// Frames drawn per second, over each ten seconds.
+	static Uint32 since = SDL_GetTicks();
+	static int counted;
+	counted++;
+	if (SDL_GetTicks() - since >= 10000) {
+		upscale_log("[upscale] %.1f frames/s with %d passes", counted * 1000.0 / (SDL_GetTicks() - since), (int)upscale_chain.size());
+		since = SDL_GetTicks(); counted = 0;
+	}
 	GLenum err = glGetError();
-	if (frames < 3 || err) upscale_log("[upscale] frame %d: filter %d, %dx%d into %d,%d %dx%d of %dx%d, fb %d, texture %d, GL error 0x%x",
-		frames, f, w, h, vx, vy, vw, vh, dw, dh, screen_fb, sdl_tex, err);
+	if (frames < 3 || err) upscale_log("[upscale] frame %d: %d passes, %dx%d into %d,%d %dx%d of %dx%d, fb %d, texture %d, GL error 0x%x",
+		frames, (int)upscale_chain.size(), w, h, vx, vy, vw, vh, dw, dh, screen_fb, sdl_tex, err);
 	return !upscale_failed;
 }
 #endif
@@ -1180,6 +1317,9 @@ static int present_sdl_video()
 	// cleared.  Not doing so can, if and when letterboxing is applied (whereby
 	// colored bars are drawn on the screen's sides to help with aspect-ratio
 	// correction), the colored bars can be an unknown color.
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: new frame from the Mac");
+#endif
 	SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 0);	// Use black
 	SDL_RenderClear(sdl_renderer);						// Clear the display
 	
@@ -1209,6 +1349,9 @@ static int present_sdl_video()
 
 	uint8_t *dstPixels;
 	int dstPitch;
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: updating SDL's texture");
+#endif
 	if (SDL_LockTexture(sdl_texture, &sdl_update_video_rect, (void **)&dstPixels, &dstPitch) < 0) {
 		SDL_UnlockMutex(sdl_update_video_mutex);
 		return -1;
@@ -1219,6 +1362,9 @@ static int present_sdl_video()
 		dstPixels += dstPitch;
 	}
 	SDL_UnlockTexture(sdl_texture);
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: SDL's texture updated");
+#endif
 
     // We are done working with pixels in host_surface.  Reset sdl_update_video_rect, then let
     // other threads modify it, as-needed.
@@ -1238,6 +1384,9 @@ static int present_sdl_video()
 	
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: presented");
+#endif
     
     // Indicate success to the caller!
     return 0;
