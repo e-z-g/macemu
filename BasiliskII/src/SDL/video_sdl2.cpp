@@ -196,6 +196,245 @@ static void (*video_refresh)(void);
 // Prototypes
 static int redraw_func(void *arg);
 static int present_sdl_video();
+
+#ifdef __ANDROID__
+/*
+ *  Android: the Mac's screen drawn through an upscaling shader instead of
+ *  SDL_RenderCopy (Carmen Time on the Board). The shaders are the APK's
+ *  assets web/shaders/*.glsl in the libretro GLSL format (filters.txt there
+ *  lists them); the first pass copies SDL's texture (RGBA bytes: SDL keeps
+ *  SheepShaver's BGRA8888 as its own RGBA texture) upright into a texture
+ *  the size of the Mac's screen, the filter's passes then draw into the
+ *  letterbox SDL's logical size gives. The filter is set from Java (MainActivity.nativeSetFilter).
+ */
+#include <GLES3/gl3.h>
+#include <jni.h>
+#include <map>
+#include <android/log.h>
+#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "CarmenSS", __VA_ARGS__)
+#include <pthread.h>
+#include <unistd.h>
+
+// SheepShaver reports on stdout and stderr, which Android drops: both go to
+// the log (tag CarmenSS, "[stdout]") from the start.
+static void *stdout_pump(void *fd)
+{
+	char buf[1024];
+	std::string line;
+	for (ssize_t n; (n = read((int)(intptr_t)fd, buf, sizeof(buf))) > 0; )
+		for (ssize_t i = 0; i < n; i++) {
+			if (buf[i] == '\n') { upscale_log("[stdout] %s", line.c_str()); line.clear(); }
+			else line += buf[i];
+		}
+	return NULL;
+}
+__attribute__((constructor)) static void stdout_to_log()
+{
+	int p[2];
+	if (pipe(p) != 0) return;
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+	dup2(p[1], 1);
+	dup2(p[1], 2);
+	pthread_t t;
+	pthread_create(&t, NULL, stdout_pump, (void *)(intptr_t)p[0]);
+	pthread_detach(t);
+}
+
+static volatile int upscale_filter = 0;
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *, jclass, jint f)
+{
+	upscale_filter = f;
+}
+
+struct UpscalePass { const char *file; bool nearest; };
+static const UpscalePass upscale_filters[4][3] = {
+	{{"sharp-bilinear.glsl", false}},
+	{{"xbr-lv2.glsl", true}},
+	{{"fsr-pass0.glsl", false}, {"fsr-pass1.glsl", false}},
+	{{"plain.glsl", false}},
+};
+static std::map<std::string, GLuint> upscale_programs;
+static GLuint upscale_vbo, upscale_fbo, upscale_tex[2];
+static int upscale_tex_w[2], upscale_tex_h[2];
+static bool upscale_failed;
+static int upscale_generation;		// raised whenever the renderer (and so the GL context) is made
+
+static GLuint upscale_compile(const std::string &src, GLenum stage, const char *defs)
+{
+	std::string text = std::string("#version 300 es\n#define ") + (stage == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT")
+		+ "\nprecision highp float;\n" + defs;
+	size_t v = src.find("#version");
+	std::string body = v == std::string::npos ? src : src.substr(0, v) + "//" + src.substr(v);
+	// libretro's "#pragma parameter" lines carry quoted names, which Mali's compiler refuses.
+	for (size_t at; (at = body.find("#pragma parameter")) != std::string::npos; )
+		body.replace(at, 7, "//");
+	text += body;
+	GLuint sh = glCreateShader(stage);
+	const char *c = text.c_str();
+	glShaderSource(sh, 1, &c, NULL);
+	glCompileShader(sh);
+	GLint ok = 0;
+	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[2048];
+		glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+		upscale_log("[upscale] shader did not compile: %s\n", log);
+		return 0;
+	}
+	return sh;
+}
+
+static GLuint upscale_program(const char *file, const char *defs)
+{
+	std::string key = std::string(file) + defs;
+	auto it = upscale_programs.find(key);
+	if (it != upscale_programs.end()) return it->second;
+	GLuint p = 0;
+	SDL_RWops *rw = SDL_RWFromFile((std::string("web/shaders/") + file).c_str(), "rb");
+	if (rw) {
+		Sint64 n = SDL_RWsize(rw);
+		std::string src(n > 0 ? n : 0, '\0');
+		SDL_RWread(rw, &src[0], 1, src.size());
+		SDL_RWclose(rw);
+		GLuint vs = upscale_compile(src, GL_VERTEX_SHADER, defs), fs = upscale_compile(src, GL_FRAGMENT_SHADER, defs);
+		if (vs && fs) {
+			p = glCreateProgram();
+			glAttachShader(p, vs);
+			glAttachShader(p, fs);
+			glBindAttribLocation(p, 0, "VertexCoord");
+			glBindAttribLocation(p, 1, "TexCoord");
+			glLinkProgram(p);
+			GLint ok = 0;
+			glGetProgramiv(p, GL_LINK_STATUS, &ok);
+			if (!ok) { upscale_log("[upscale] %s did not link\n", file); glDeleteProgram(p); p = 0; }
+		}
+	} else {
+		upscale_log("[upscale] no web/shaders/%s\n", file);
+	}
+	upscale_log("[upscale] %s%s %s\n", file, defs, p ? "ready" : "failed");
+	upscale_programs[key] = p;
+	return p;
+}
+
+// A texture to draw into, kept between frames (0: the Mac's screen size, 1: the letterbox's).
+static GLuint upscale_target(int i, int w, int h)
+{
+	if (!upscale_tex[i]) glGenTextures(1, &upscale_tex[i]);
+	glBindTexture(GL_TEXTURE_2D, upscale_tex[i]);
+	if (upscale_tex_w[i] != w || upscale_tex_h[i] != h) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		upscale_tex_w[i] = w; upscale_tex_h[i] = h;
+	}
+	return upscale_tex[i];
+}
+
+// One pass: program p reads texture src (sw x sh) into the bound framebuffer's viewport (ow x oh).
+static void upscale_draw(GLuint p, GLuint src, bool nearest, int sw, int sh, int ow, int oh)
+{
+	static const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+	glUseProgram(p);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, src);
+	GLint f = nearest ? GL_NEAREST : GL_LINEAR;
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+	glUniformMatrix4fv(glGetUniformLocation(p, "MVPMatrix"), 1, GL_FALSE, id);
+	glUniform2f(glGetUniformLocation(p, "TextureSize"), sw, sh);
+	glUniform2f(glGetUniformLocation(p, "InputSize"), sw, sh);
+	glUniform2f(glGetUniformLocation(p, "OutputSize"), ow, oh);
+	glUniform1i(glGetUniformLocation(p, "Texture"), 0);
+	glUniform1i(glGetUniformLocation(p, "decal"), 0);
+	glUniform1i(glGetUniformLocation(p, "FrameCount"), 0);
+	glUniform1i(glGetUniformLocation(p, "FrameDirection"), 1);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// Draws texture (w x h) through the current filter; false if it could not (then SDL draws it).
+static bool upscale_present(SDL_Texture *texture, int w, int h)
+{
+	// A new video mode brings a new renderer and GL context (perhaps at the
+	// same address): everything made in the old one is gone.
+	static int generation = -1;
+	if (upscale_generation != generation) {
+		generation = upscale_generation;
+		upscale_programs.clear();
+		upscale_vbo = upscale_fbo = 0;
+		upscale_tex[0] = upscale_tex[1] = 0;
+		upscale_tex_w[0] = upscale_tex_w[1] = upscale_tex_h[0] = upscale_tex_h[1] = 0;
+		upscale_failed = false;
+		upscale_log("[upscale] new GL context");
+	}
+	if (upscale_failed) return false;
+	SDL_RenderFlush(sdl_renderer);
+	static int frames;
+	if (!frames++) upscale_log("[upscale] %s, GLSL %s", glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
+	int dw, dh;
+	if (SDL_GetRendererOutputSize(sdl_renderer, &dw, &dh) != 0) return false;
+	float s = fminf(dw / (float)w, dh / (float)h);
+	int vw = lroundf(w * s), vh = lroundf(h * s), vx = (dw - vw) / 2, vy = (dh - vh) / 2;
+	int f = upscale_filter & 3;
+	GLuint copy = upscale_program("plain.glsl", "#define FLIP\n");
+	if (!copy) { upscale_failed = true; return false; }
+
+	GLint screen_fb = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen_fb);
+	if (!upscale_vbo) {
+		static const float quad[] = {-1,-1,0,1, 0,0,  1,-1,0,1, 1,0,  -1,1,0,1, 0,1,  1,1,0,1, 1,1};
+		glGenBuffers(1, &upscale_vbo);
+		glBindBuffer(GL_ARRAY_BUFFER, upscale_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+		glGenFramebuffers(1, &upscale_fbo);
+	}
+	glBindBuffer(GL_ARRAY_BUFFER, upscale_vbo);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 24, (void *)0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, (void *)16);
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+
+	// SDL's texture, upright, into a texture of the Mac's size.
+	glActiveTexture(GL_TEXTURE0);
+	if (SDL_GL_BindTexture(texture, NULL, NULL) != 0) { upscale_failed = true; return false; }
+	GLint sdl_tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &sdl_tex);
+	GLuint src = upscale_target(0, w, h);
+	glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src, 0);
+	glViewport(0, 0, w, h);
+	upscale_draw(copy, sdl_tex, true, w, h, w, h);
+	SDL_GL_UnbindTexture(texture);
+
+	int sw = w, sh = h;
+	for (int i = 0; i < 3 && upscale_filters[f][i].file; i++) {
+		const UpscalePass &pass = upscale_filters[f][i];
+		GLuint p = upscale_program(pass.file, "");
+		if (!p) { upscale_failed = true; break; }
+		bool last = i == 2 || !upscale_filters[f][i + 1].file;
+		GLuint dst = 0;
+		if (last) {
+			glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
+			glViewport(vx, vy, vw, vh);
+		} else {
+			dst = upscale_target(1, vw, vh);
+			glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst, 0);
+			glViewport(0, 0, vw, vh);
+		}
+		upscale_draw(p, src, pass.nearest, sw, sh, vw, vh);
+		src = dst; sw = vw; sh = vh;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
+	glUseProgram(0);
+	GLenum err = glGetError();
+	if (frames < 3 || err) upscale_log("[upscale] frame %d: filter %d, %dx%d into %d,%d %dx%d of %dx%d, fb %d, texture %d, GL error 0x%x",
+		frames, f, w, h, vx, vy, vw, vh, dw, dh, screen_fb, sdl_tex, err);
+	return !upscale_failed;
+}
+#endif
 static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event);
 static bool is_fullscreen(SDL_Window *);
 
@@ -763,6 +1002,13 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	
 	if (!sdl_window) {
 		float m = get_mag_rate();
+#ifdef __ANDROID__
+		// GLSL ES 3.00 for the upscaling shaders; SDL's GLES2 renderer keeps
+		// an ES context of version 2 or later as it is asked for.
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
 		sdl_window = SDL_CreateWindow(
 			"",
 			SDL_WINDOWPOS_UNDEFINED,
@@ -807,6 +1053,9 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		}
 
 		sdl_renderer = SDL_CreateRenderer(sdl_window, -1, 0);
+#ifdef __ANDROID__
+		upscale_generation++;
+#endif
 
 		if (!sdl_renderer) {
 			shutdown_sdl_video();
@@ -980,6 +1229,9 @@ static int present_sdl_video()
     SDL_UnlockMutex(sdl_update_video_mutex);
 
     // Copy the texture to the display
+#ifdef __ANDROID__
+	if (!upscale_present(sdl_texture, guest_surface->w, guest_surface->h))
+#endif
     if (SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL) != 0) {
 		return -1;
 	}
