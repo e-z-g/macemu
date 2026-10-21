@@ -19,6 +19,7 @@
  */
 
 #include "sysdeps.h"
+#include <string>
 
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -542,6 +543,23 @@ static mac_file_handle *open_filehandle(const char *name)
 
 void *Sys_open(const char *name, bool read_only, bool is_cdrom)
 {
+	// "path@OFFSET:LENGTH": the image is LENGTH bytes at OFFSET inside the
+	// file, read-only (the Board app's CD stays where Android keeps it,
+	// stored uncompressed in the APK, instead of being copied out).
+	std::string inner_path;
+	loff_t inner_offset = -1, inner_length = 0;
+	{
+		const char *at = strrchr(name, '@');
+		long long o, l;
+		char tail;
+		if (at && strchr(at, '/') == NULL && sscanf(at + 1, "%lld:%lld%c", &o, &l, &tail) == 2 && o >= 0 && l > 0) {
+			inner_path.assign(name, at - name);
+			name = inner_path.c_str();
+			inner_offset = o;
+			inner_length = l;
+			read_only = true;
+		}
+	}
 	bool is_file = strncmp(name, "/dev/", 5) != 0;
 #if defined(__FreeBSD__)
 	                // SCSI                             IDE
@@ -667,6 +685,10 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
 			lseek(fd, 0, SEEK_SET);
 			read(fd, data, 256);
 			FileDiskLayout(size, data, fh->start_byte, fh->file_size);
+			if (inner_offset >= 0) {
+				fh->start_byte = inner_offset;
+				fh->file_size = inner_length;
+			}
 		} else {
 			struct stat st;
 			if (fstat(fd, &st) == 0) {
