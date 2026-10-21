@@ -1224,7 +1224,7 @@ quit:
 // here has hung there. PRAM is saved first; the disks' writes are already
 // the kernel's.
 static volatile bool mac_off;
-extern "C" JNIEXPORT jboolean JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeMacOff(JNIEnv *, jclass)
+extern "C" JNIEXPORT jboolean JNICALL Java_io_github_ratlizard_sheepboard_MainActivity_nativeMacOff(JNIEnv *, jclass)
 {
 	return mac_off;
 }

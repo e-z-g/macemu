@@ -212,7 +212,7 @@ static int present_sdl_video();
 #include <map>
 #include <mutex>
 #include <android/log.h>
-#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "CarmenSS", __VA_ARGS__)
+#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "SheepShaver", __VA_ARGS__)
 #include <pthread.h>
 #include <unistd.h>
 
@@ -246,7 +246,7 @@ __attribute__((constructor)) static void stdout_to_log()
 // describes them; the app's Upscaler.java picks and expands them).
 static std::mutex upscale_lock;
 static std::string upscale_spec = "sharp-bilinear.glsl:linear";
-extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_sheepboard_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
 {
 	const char *c = env->GetStringUTFChars(spec, NULL);
 	std::lock_guard<std::mutex> g(upscale_lock);
