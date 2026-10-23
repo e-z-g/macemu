@@ -257,6 +257,8 @@ void sheepshaver_cpu::execute_sheep(uint32 opcode)
 
 	switch (opcode & 0x3f) {
 	case 0:		// EMUL_RETURN
+		// The Shutdown Manager's way out (rom_patches.cpp), so where the Mac went off from.
+		printf("[quit] EMUL_RETURN at pc %08x, 68k pc %08x, lr %08x, 68k sp %08x\n", pc(), gpr(24), lr(), gpr(1));
 		QuitEmulator();
 		break;
 

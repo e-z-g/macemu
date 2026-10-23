@@ -1228,11 +1228,32 @@ extern "C" JNIEXPORT jboolean JNICALL Java_io_github_ratlizard_sheepboard_MainAc
 {
 	return mac_off;
 }
+
+// Who called Quit, straight to the Android log (stdout's pump can lose the
+// last lines when the app kills the process).
+#include <android/log.h>
+#include <unwind.h>
+#include <dlfcn.h>
+static _Unwind_Reason_Code quit_trace_step(struct _Unwind_Context *c, void *n)
+{
+	uintptr_t pc = _Unwind_GetIP(c);
+	Dl_info info;
+	if (pc && dladdr((void *)pc, &info) && info.dli_sname)
+		__android_log_print(ANDROID_LOG_INFO, "SheepShaver", "[quit] #%d %s+0x%lx", (*(int *)n)++, info.dli_sname, (unsigned long)(pc - (uintptr_t)info.dli_saddr));
+	else if (pc)
+		__android_log_print(ANDROID_LOG_INFO, "SheepShaver", "[quit] #%d %p (%s)", (*(int *)n)++, (void *)pc, info.dli_fname ? info.dli_fname : "?");
+	return *(int *)n < 16 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
 #endif
 
 static void Quit(void)
 {
 #ifdef __ANDROID__
+	{
+		__android_log_print(ANDROID_LOG_INFO, "SheepShaver", "[quit] Quit() called from:");
+		int n = 0;
+		_Unwind_Backtrace(quit_trace_step, &n);
+	}
 	SaveXPRAM();
 	mac_off = true;
 #endif

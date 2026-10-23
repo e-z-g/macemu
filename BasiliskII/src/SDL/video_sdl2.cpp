@@ -2837,6 +2837,7 @@ static void handle_events(void)
 					code = keycode_table[event.key.keysym.scancode & 0xff];
 				if (code == CODE_INVALID)
 					code = event2keycode(event.key, true);
+				printf("[key] down: SDL key %d, Mac code %d\n", (int)event.key.keysym.sym, code);
 				if (code >= 0) {
 					if (!emul_suspended) {
 						code = modify_opt_cmd(code);
@@ -2895,6 +2896,7 @@ static void handle_events(void)
 
 			// Window "close" widget clicked
 			case SDL_QUIT:
+				printf("[quit] SDL_QUIT: the power key\n");
 				if (SDL_GetModState() & (KMOD_LALT | KMOD_RALT)) break;
 				ADBKeyDown(0x7f);	// Power key
 				ADBKeyUp(0x7f);
