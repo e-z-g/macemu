@@ -254,6 +254,16 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_sheepboard_MainActivi
 	env->ReleaseStringUTFChars(spec, c);
 }
 
+// A magnifier over the picture (lens.glsl), set from Java (PieceStick's zoom
+// piece): centre X, Y and radius in display pixels (Y down, as touches), and
+// the zoom; a radius of 0 is none.
+static float upscale_lens[4];
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_sheepboard_MainActivity_nativeSetLens(JNIEnv *, jclass, jfloat x, jfloat y, jfloat r, jfloat zoom)
+{
+	std::lock_guard<std::mutex> g(upscale_lock);
+	upscale_lens[0] = x; upscale_lens[1] = y; upscale_lens[2] = r; upscale_lens[3] = zoom;
+}
+
 struct UpscalePass { std::string file; bool nearest, half; int mult; };
 static std::vector<UpscalePass> upscale_chain;
 static std::string upscale_parsed;
@@ -468,11 +478,14 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 			std::string file = list.substr(b == std::string::npos ? 0 : b + 1, at + 5 - (b == std::string::npos ? 0 : b + 1));
 			if (upscale_programs.find(file) == upscale_programs.end()) { upscale_program(file.c_str(), ""); count++; }
 		}
+		upscale_program("lens.glsl", "");
 		upscale_log("[upscale] %d shaders compiled in %u ms", count, SDL_GetTicks() - t0);
 	}
+	float lens[4];
 	{
 		std::lock_guard<std::mutex> g(upscale_lock);
 		if (upscale_spec != upscale_parsed) { upscale_parse(upscale_spec); upscale_trace = 2; }
+		memcpy(lens, upscale_lens, sizeof(lens));
 	}
 #define UPSCALE_STEP(...) do { if (upscale_trace) { upscale_log("[upscale] step: " __VA_ARGS__); glFinish(); upscale_log("[upscale] (finished)"); } } while (0)
 	if (upscale_trace) upscale_log("[upscale] step: start of frame");
@@ -524,6 +537,8 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 	SDL_GL_UnbindTexture(texture);
 	UPSCALE_STEP("copied, GL error 0x%x", glGetError());
 
+	// With a lens, the last pass draws into a target of the picture's size, and lens.glsl draws that on screen.
+	GLuint lens_prog = lens[2] > 0 ? upscale_program("lens.glsl", "") : 0;
 	std::vector<UpscaleTarget> outs(1, orig);
 	for (size_t k = 0; k < upscale_chain.size(); k++) {
 		const UpscalePass &pass = upscale_chain[k];
@@ -533,7 +548,9 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 		bool last = k + 1 == upscale_chain.size();
 		int ow = last || !pass.mult ? vw : in.w * pass.mult, oh = last || !pass.mult ? vh : in.h * pass.mult;
 		UpscaleTarget out = {0, ow, oh, false};
-		if (last) {
+		if (last && lens_prog) {
+			out = upscale_target(k + 1, ow, oh, false);
+		} else if (last) {
 			glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
 			glViewport(vx, vy, vw, vh);
 		} else {
@@ -556,6 +573,22 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 		glActiveTexture(GL_TEXTURE0);
 		upscale_sampling(GL_NEAREST);
 		outs.push_back(out);
+	}
+	if (lens_prog && !upscale_failed) {
+		const UpscaleTarget &pic = outs.back();
+		glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
+		glViewport(vx, vy, vw, vh);
+		glUseProgram(lens_prog);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, pic.tex);
+		upscale_sampling(GL_LINEAR);
+		glUniform1i(glGetUniformLocation(lens_prog, "Texture"), 0);
+		glUniform2f(glGetUniformLocation(lens_prog, "Size"), vw, vh);
+		glUniform2f(glGetUniformLocation(lens_prog, "Center"), lens[0] - vx, (dh - lens[1]) - vy);
+		glUniform1f(glGetUniformLocation(lens_prog, "Radius"), lens[2]);
+		glUniform1f(glGetUniformLocation(lens_prog, "Zoom"), lens[3]);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		upscale_sampling(GL_NEAREST);
 	}
 	if (upscale_trace) upscale_trace--;
 	// Frames drawn per second, over each ten seconds.
