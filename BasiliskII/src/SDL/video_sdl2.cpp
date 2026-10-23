@@ -1445,6 +1445,17 @@ static int present_sdl_video()
 	
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
+#ifndef __ANDROID__
+	// Frames presented, every ten seconds, to compare with the Board's [present] lines.
+	static Uint32 present_since = SDL_GetTicks();
+	static int present_count;
+	present_count++;
+	if (SDL_GetTicks() - present_since >= 10000) {
+		printf("[present] %d frames in %.1f s\n", present_count, (SDL_GetTicks() - present_since) / 1000.0);
+		fflush(stdout);
+		present_since = SDL_GetTicks(); present_count = 0;
+	}
+#endif
 #ifdef __ANDROID__
 	if (upscale_trace) upscale_log("[upscale] step: presented");
 #endif
