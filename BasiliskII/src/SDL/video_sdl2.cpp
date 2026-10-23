@@ -1329,9 +1329,36 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
     return guest_surface;
 }
 
+#ifdef __ANDROID__
+// Time spent presenting, on the emulator's thread (VideoVBL), logged every ten seconds:
+// converting the Mac's pixels, uploading them, and the filter passes with the present.
+static Uint64 present_since, present_convert, present_upload, present_draw, present_area;
+static int present_count;
+static void present_note(Uint64 t0, Uint64 t1, Uint64 t2, Uint64 t3, int area)
+{
+	Uint64 now = SDL_GetPerformanceCounter(), f = SDL_GetPerformanceFrequency();
+	if (!present_since) present_since = now;
+	present_convert += t1 - t0; present_upload += t2 - t1; present_draw += t3 - t2;
+	present_area += area; present_count++;
+	if (now - present_since >= 10 * f) {
+		double ms = 1000.0 / f, n = present_count;
+		upscale_log("[present] %d frames in %.1f s, each %.1f ms (convert %.1f, upload %.1f, filter and present %.1f), %.0f%% of the emulator's time, changed area %.0f%% of the screen",
+			present_count, (now - present_since) * ms / 1000, (present_convert + present_upload + present_draw) * ms / n,
+			present_convert * ms / n, present_upload * ms / n, present_draw * ms / n,
+			100.0 * (present_convert + present_upload + present_draw) / (now - present_since),
+			100.0 * present_area / n / (guest_surface->w * guest_surface->h));
+		present_since = now; present_convert = present_upload = present_draw = present_area = 0; present_count = 0;
+	}
+}
+#endif
+
 static int present_sdl_video()
 {
 	if (SDL_RectEmpty(&sdl_update_video_rect)) return 0;
+#ifdef __ANDROID__
+	Uint64 t0 = SDL_GetPerformanceCounter(), t1, t2;
+	int area = sdl_update_video_rect.w * sdl_update_video_rect.h;
+#endif
 	
 	if (!sdl_renderer || !sdl_texture || !guest_surface) {
 		printf("WARNING: A video mode does not appear to have been set.\n");
@@ -1374,6 +1401,9 @@ static int present_sdl_video()
 		}
 	}
 	UNLOCK_PALETTE; // passed potential deadlock, can unlock palette
+#ifdef __ANDROID__
+	t1 = SDL_GetPerformanceCounter();
+#endif
 	
     // Update the host OS' texture
 	uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
@@ -1396,6 +1426,7 @@ static int present_sdl_video()
 	}
 	SDL_UnlockTexture(sdl_texture);
 #ifdef __ANDROID__
+	t2 = SDL_GetPerformanceCounter();
 	if (upscale_trace) upscale_log("[upscale] step: SDL's texture updated");
 #endif
 
@@ -1419,6 +1450,7 @@ static int present_sdl_video()
 	SDL_RenderPresent(sdl_renderer);
 #ifdef __ANDROID__
 	if (upscale_trace) upscale_log("[upscale] step: presented");
+	present_note(t0, t1, t2, SDL_GetPerformanceCounter(), area);
 #endif
     
     // Indicate success to the caller!
