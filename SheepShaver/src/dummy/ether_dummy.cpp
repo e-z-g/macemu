@@ -90,3 +90,12 @@ void AO_transmit_packet(uint32 mp)
 void EtherIRQ(void)
 {
 }
+
+
+/*
+ *  Reset (main.cpp calls it on a reboot; there is nothing to reset)
+ */
+
+void ether_reset(void)
+{
+}

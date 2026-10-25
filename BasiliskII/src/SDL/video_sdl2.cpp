@@ -196,6 +196,382 @@ static void (*video_refresh)(void);
 // Prototypes
 static int redraw_func(void *arg);
 static int present_sdl_video();
+
+#ifdef __ANDROID__
+/*
+ *  Android: the Mac's screen drawn through an upscaling shader instead of
+ *  SDL_RenderCopy (Carmen Time on the Board). The shaders are the APK's
+ *  assets web/shaders/*.glsl in the libretro GLSL format (filters.txt there
+ *  lists them); the first pass copies SDL's texture (RGBA bytes: SDL keeps
+ *  SheepShaver's BGRA8888 as its own RGBA texture) upright into a texture
+ *  the size of the Mac's screen, the filter's passes then draw into the
+ *  letterbox SDL's logical size gives. The filter is set from Java (MainActivity.nativeSetFilter).
+ */
+#include <GLES3/gl3.h>
+#include <jni.h>
+#include <map>
+#include <mutex>
+#include <android/log.h>
+#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "CarmenSS", __VA_ARGS__)
+#include <pthread.h>
+#include <unistd.h>
+
+// SheepShaver reports on stdout and stderr, which Android drops: both go to
+// the log (tag CarmenSS, "[stdout]") from the start.
+static void *stdout_pump(void *fd)
+{
+	char buf[1024];
+	std::string line;
+	for (ssize_t n; (n = read((int)(intptr_t)fd, buf, sizeof(buf))) > 0; )
+		for (ssize_t i = 0; i < n; i++) {
+			if (buf[i] == '\n') { upscale_log("[stdout] %s", line.c_str()); line.clear(); }
+			else line += buf[i];
+		}
+	return NULL;
+}
+__attribute__((constructor)) static void stdout_to_log()
+{
+	int p[2];
+	if (pipe(p) != 0) return;
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+	dup2(p[1], 1);
+	dup2(p[1], 2);
+	pthread_t t;
+	pthread_create(&t, NULL, stdout_pump, (void *)(intptr_t)p[0]);
+	pthread_detach(t);
+}
+
+// The passes to draw with, "shader:options ..." (the APK's web/shaders/filters.txt
+// describes them; the app's Upscaler.java picks and expands them).
+static std::mutex upscale_lock;
+static std::string upscale_spec = "sharp-bilinear.glsl:linear";
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
+{
+	const char *c = env->GetStringUTFChars(spec, NULL);
+	std::lock_guard<std::mutex> g(upscale_lock);
+	upscale_spec = c;
+	env->ReleaseStringUTFChars(spec, c);
+}
+
+struct UpscalePass { std::string file; bool nearest, half; int mult; };
+static std::vector<UpscalePass> upscale_chain;
+static std::string upscale_parsed;
+
+static void upscale_parse(const std::string &spec)
+{
+	upscale_chain.clear();
+	size_t i = 0;
+	while (i < spec.size()) {
+		while (i < spec.size() && spec[i] == ' ') i++;
+		size_t e = spec.find(' ', i);
+		if (e == std::string::npos) e = spec.size();
+		if (e > i) {
+			std::string tok = spec.substr(i, e - i), opts;
+			size_t c = tok.find(':');
+			UpscalePass p = {tok.substr(0, c), false, false, 0};
+			if (c != std::string::npos) opts = "," + tok.substr(c + 1) + ",";
+			p.nearest = opts.find(",nearest,") != std::string::npos;
+			p.half = opts.find(",float,") != std::string::npos;
+			for (int m = 1; m <= 9; m++)
+				if (opts.find(",x" + std::to_string(m) + ",") != std::string::npos) p.mult = m;
+			upscale_chain.push_back(p);
+		}
+		i = e;
+	}
+	upscale_parsed = spec;
+	upscale_log("[upscale] passes: %s", spec.c_str());
+}
+
+static std::map<std::string, GLuint> upscale_programs;
+struct UpscaleTarget { GLuint tex; int w, h; bool half; };
+static std::vector<UpscaleTarget> upscale_targets;	// 0: the Mac's screen upright, k + 1: what pass k drew
+static GLuint upscale_vbo, upscale_fbo;
+static bool upscale_failed, upscale_half_ok = true;
+static int upscale_generation;		// raised whenever the renderer (and so the GL context) is made
+
+static GLuint upscale_compile(const std::string &src, GLenum stage, const char *defs)
+{
+	std::string text = std::string("#version 300 es\n#define ") + (stage == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT")
+		+ "\nprecision highp float;\n" + defs;
+	size_t v = src.find("#version");
+	std::string body = v == std::string::npos ? src : src.substr(0, v) + "//" + src.substr(v);
+	// libretro's "#pragma parameter" lines carry quoted names, which Mali's compiler refuses.
+	for (size_t at; (at = body.find("#pragma parameter")) != std::string::npos; )
+		body.replace(at, 7, "//");
+	// Its shaders ask for mediump on GL ES, too coarse for texel offsets at these sizes.
+	for (size_t at = 0; (at = body.find("mediump", at)) != std::string::npos; at += 5)
+		body.replace(at, 7, "highp");
+	text += body;
+	GLuint sh = glCreateShader(stage);
+	const char *c = text.c_str();
+	glShaderSource(sh, 1, &c, NULL);
+	glCompileShader(sh);
+	GLint ok = 0;
+	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[2048];
+		glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+		upscale_log("[upscale] shader did not compile: %s\n", log);
+		return 0;
+	}
+	return sh;
+}
+
+static GLuint upscale_program(const char *file, const char *defs)
+{
+	std::string key = std::string(file) + defs;
+	auto it = upscale_programs.find(key);
+	if (it != upscale_programs.end()) return it->second;
+	GLuint p = 0;
+	SDL_RWops *rw = SDL_RWFromFile((std::string("web/shaders/") + file).c_str(), "rb");
+	if (rw) {
+		Sint64 n = SDL_RWsize(rw);
+		std::string src(n > 0 ? n : 0, '\0');
+		SDL_RWread(rw, &src[0], 1, src.size());
+		SDL_RWclose(rw);
+		GLuint vs = upscale_compile(src, GL_VERTEX_SHADER, defs), fs = upscale_compile(src, GL_FRAGMENT_SHADER, defs);
+		if (vs && fs) {
+			p = glCreateProgram();
+			glAttachShader(p, vs);
+			glAttachShader(p, fs);
+			glBindAttribLocation(p, 0, "VertexCoord");
+			glBindAttribLocation(p, 1, "TexCoord");
+			glLinkProgram(p);
+			GLint ok = 0;
+			glGetProgramiv(p, GL_LINK_STATUS, &ok);
+			if (!ok) { upscale_log("[upscale] %s did not link\n", file); glDeleteProgram(p); p = 0; }
+		}
+	} else {
+		upscale_log("[upscale] no web/shaders/%s\n", file);
+	}
+	upscale_log("[upscale] %s%s %s\n", file, defs, p ? "ready" : "failed");
+	upscale_programs[key] = p;
+	return p;
+}
+
+// Target i at w x h, bound as the framebuffer to draw into (a half-float one if
+// asked for and the GPU can draw into it); kept between frames.
+static UpscaleTarget &upscale_target(size_t i, int w, int h, bool half)
+{
+	while (upscale_targets.size() <= i) {
+		UpscaleTarget t = {0, 0, 0, false};
+		glGenTextures(1, &t.tex);
+		upscale_targets.push_back(t);
+	}
+	UpscaleTarget &t = upscale_targets[i];
+	half = half && upscale_half_ok;
+	glBindTexture(GL_TEXTURE_2D, t.tex);
+	if (t.w != w || t.h != h || t.half != half) {
+		if (half) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
+		else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		t.w = w; t.h = h; t.half = half;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, upscale_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+	if (half && glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		upscale_log("[upscale] no half-float targets here; eight bits instead");
+		upscale_half_ok = false;
+		t.w = 0;
+		return upscale_target(i, w, h, false);
+	}
+	glViewport(0, 0, w, h);
+	return t;
+}
+
+// Binds texture t (w x h) to a unit as the libretro uniforms <name>Texture, <name>TextureSize, <name>InputSize.
+static void upscale_bind(GLuint p, int unit, GLuint t, int w, int h, const std::string &name)
+{
+	glActiveTexture(GL_TEXTURE0 + unit);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glUniform1i(glGetUniformLocation(p, (name + "Texture").c_str()), unit);
+	glUniform2f(glGetUniformLocation(p, (name + "TextureSize").c_str()), w, h);
+	glUniform2f(glGetUniformLocation(p, (name + "InputSize").c_str()), w, h);
+}
+
+static void upscale_sampling(GLint f)
+{
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+}
+
+static void upscale_uniforms(GLuint p, int ow, int oh)
+{
+	static const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+	glUniformMatrix4fv(glGetUniformLocation(p, "MVPMatrix"), 1, GL_FALSE, id);
+	glUniform2f(glGetUniformLocation(p, "OutputSize"), ow, oh);
+	glUniform1i(glGetUniformLocation(p, "FrameCount"), 0);
+	glUniform1i(glGetUniformLocation(p, "FrameDirection"), 1);
+}
+
+// Draws texture (w x h) through the passes; false if it could not (then SDL draws it).
+static int upscale_trace;	// frames left to trace step by step after a change of passes
+
+// The GL state SDL's renderer keeps track of, put back as it was after the passes.
+struct UpscaleSaved {
+	GLint program, array_buffer, active, tex[4], fb, viewport[4], attrib[3];
+	void save() {
+		glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex[i]); }
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+		glGetIntegerv(GL_VIEWPORT, viewport);
+		for (int i = 0; i < 3; i++) glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &attrib[i]);
+	}
+	void restore() {
+		for (int i = 7; i >= 0; i--) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, i < 4 ? tex[i] : 0); }
+		glActiveTexture(active);
+		glBindFramebuffer(GL_FRAMEBUFFER, fb);
+		glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+		glUseProgram(program);
+		glBindBuffer(GL_ARRAY_BUFFER, array_buffer);
+		for (int i = 0; i < 3; i++) { if (attrib[i]) glEnableVertexAttribArray(i); else glDisableVertexAttribArray(i); }
+	}
+};
+
+static bool upscale_present(SDL_Texture *texture, int w, int h)
+{
+	// A new video mode brings a new renderer and GL context (perhaps at the
+	// same address): everything made in the old one is gone.
+	static int generation = -1;
+	if (upscale_generation != generation) {
+		generation = upscale_generation;
+		upscale_programs.clear();
+		upscale_targets.clear();
+		upscale_vbo = upscale_fbo = 0;
+		upscale_failed = false;
+		upscale_log("[upscale] new GL context");
+	}
+	if (upscale_failed) return false;
+	// Every shader filters.txt names is compiled with the first frame, so a
+	// change of filter never stops this thread (the Mac's own) to compile.
+	static int precompiled = -1;
+	if (precompiled != generation) {
+		precompiled = generation;
+		SDL_RWops *rw = SDL_RWFromFile("web/shaders/filters.txt", "rb");
+		std::string list;
+		if (rw) {
+			Sint64 n = SDL_RWsize(rw);
+			list.assign(n > 0 ? n : 0, '\0');
+			SDL_RWread(rw, &list[0], 1, list.size());
+			SDL_RWclose(rw);
+		}
+		Uint32 t0 = SDL_GetTicks();
+		int count = 0;
+		for (size_t at = 0; (at = list.find(".glsl", at)) != std::string::npos; at += 5) {
+			size_t b = list.find_last_of(" |\n", at);
+			std::string file = list.substr(b == std::string::npos ? 0 : b + 1, at + 5 - (b == std::string::npos ? 0 : b + 1));
+			if (upscale_programs.find(file) == upscale_programs.end()) { upscale_program(file.c_str(), ""); count++; }
+		}
+		upscale_log("[upscale] %d shaders compiled in %u ms", count, SDL_GetTicks() - t0);
+	}
+	{
+		std::lock_guard<std::mutex> g(upscale_lock);
+		if (upscale_spec != upscale_parsed) { upscale_parse(upscale_spec); upscale_trace = 2; }
+	}
+#define UPSCALE_STEP(...) do { if (upscale_trace) { upscale_log("[upscale] step: " __VA_ARGS__); glFinish(); upscale_log("[upscale] (finished)"); } } while (0)
+	if (upscale_trace) upscale_log("[upscale] step: start of frame");
+	SDL_RenderFlush(sdl_renderer);
+	if (upscale_trace) upscale_log("[upscale] step: SDL flushed");
+	UpscaleSaved saved;
+	saved.save();
+	if (upscale_trace) upscale_log("[upscale] step: state saved");
+	struct Restore { UpscaleSaved &s; ~Restore() { s.restore(); } } restore_on_return = {saved};
+	static int frames;
+	if (!frames++) upscale_log("[upscale] %s, GLSL %s", glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
+	int dw, dh;
+	if (SDL_GetRendererOutputSize(sdl_renderer, &dw, &dh) != 0) return false;
+	float s = fminf(dw / (float)w, dh / (float)h);
+	int vw = lroundf(w * s), vh = lroundf(h * s), vx = (dw - vw) / 2, vy = (dh - vh) / 2;
+	GLuint copy = upscale_program("plain.glsl", "#define FLIP\n");
+	if (!copy) { upscale_failed = true; return false; }
+
+	GLint screen_fb = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &screen_fb);
+	if (!upscale_vbo) {
+		static const float quad[] = {-1,-1,0,1, 0,0,  1,-1,0,1, 1,0,  -1,1,0,1, 0,1,  1,1,0,1, 1,1};
+		glGenBuffers(1, &upscale_vbo);
+		glBindBuffer(GL_ARRAY_BUFFER, upscale_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+		glGenFramebuffers(1, &upscale_fbo);
+	}
+	glBindBuffer(GL_ARRAY_BUFFER, upscale_vbo);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 24, (void *)0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, (void *)16);
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+
+	// SDL's texture, upright, into a texture of the Mac's size: OrigTexture to the passes.
+	UpscaleTarget orig = upscale_target(0, w, h, false);
+	if (upscale_trace) upscale_log("[upscale] step: target 0");
+	glUseProgram(copy);
+	glActiveTexture(GL_TEXTURE0);
+	if (SDL_GL_BindTexture(texture, NULL, NULL) != 0) { upscale_failed = true; return false; }
+	if (upscale_trace) upscale_log("[upscale] step: SDL texture bound");
+	GLint sdl_tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &sdl_tex);
+	upscale_bind(copy, 0, sdl_tex, w, h, "");
+	upscale_sampling(GL_NEAREST);
+	upscale_uniforms(copy, w, h);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	SDL_GL_UnbindTexture(texture);
+	UPSCALE_STEP("copied, GL error 0x%x", glGetError());
+
+	std::vector<UpscaleTarget> outs(1, orig);
+	for (size_t k = 0; k < upscale_chain.size(); k++) {
+		const UpscalePass &pass = upscale_chain[k];
+		GLuint p = upscale_program(pass.file.c_str(), "");
+		if (!p) { upscale_failed = true; break; }
+		UpscaleTarget in = outs[k];
+		bool last = k + 1 == upscale_chain.size();
+		int ow = last || !pass.mult ? vw : in.w * pass.mult, oh = last || !pass.mult ? vh : in.h * pass.mult;
+		UpscaleTarget out = {0, ow, oh, false};
+		if (last) {
+			glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
+			glViewport(vx, vy, vw, vh);
+		} else {
+			out = upscale_target(k + 1, ow, oh, pass.half);
+		}
+		glUseProgram(p);
+		upscale_bind(p, 0, in.tex, in.w, in.h, "");
+		upscale_sampling(pass.nearest ? GL_NEAREST : GL_LINEAR);
+		glUniform1i(glGetUniformLocation(p, "decal"), 0);
+		upscale_bind(p, 1, orig.tex, orig.w, orig.h, "Orig");
+		for (size_t n = 2; n <= k + 1 && n < 8; n++) {
+			const UpscaleTarget &t = outs[k + 1 - n];
+			upscale_bind(p, n, t.tex, t.w, t.h, "PassPrev" + std::to_string(n));
+		}
+		upscale_uniforms(p, ow, oh);
+		UPSCALE_STEP("pass %d (%s) %dx%d from %dx%d, set up, GL error 0x%x", (int)k, pass.file.c_str(), ow, oh, in.w, in.h, glGetError());
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		UPSCALE_STEP("pass %d drawn, GL error 0x%x", (int)k, glGetError());
+		// The input's sampling back to nearest, for passes that read it as a PassPrev.
+		glActiveTexture(GL_TEXTURE0);
+		upscale_sampling(GL_NEAREST);
+		outs.push_back(out);
+	}
+	if (upscale_trace) upscale_trace--;
+	// Frames drawn per second, over each ten seconds.
+	static Uint32 since = SDL_GetTicks();
+	static int counted;
+	counted++;
+	if (SDL_GetTicks() - since >= 10000) {
+		upscale_log("[upscale] %.1f frames/s with %d passes", counted * 1000.0 / (SDL_GetTicks() - since), (int)upscale_chain.size());
+		since = SDL_GetTicks(); counted = 0;
+	}
+	GLenum err = glGetError();
+	if (frames < 3 || err) upscale_log("[upscale] frame %d: %d passes, %dx%d into %d,%d %dx%d of %dx%d, fb %d, texture %d, GL error 0x%x",
+		frames, (int)upscale_chain.size(), w, h, vx, vy, vw, vh, dw, dh, screen_fb, sdl_tex, err);
+	return !upscale_failed;
+}
+#endif
 static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event);
 static bool is_fullscreen(SDL_Window *);
 
@@ -480,18 +856,19 @@ static void sdl_display_dimensions(int &width, int &height)
 	height = desktop_mode.h;
 }
 
+// A display of no size (SDL's offscreen driver, used for scripted runs) counts as 1024x768.
 static inline int sdl_display_width(void)
 {
 	int width, height;
 	sdl_display_dimensions(width, height);
-	return width;
+	return width > 0 ? width : 1024;
 }
 
 static inline int sdl_display_height(void)
 {
 	int width, height;
 	sdl_display_dimensions(width, height);
-	return height;
+	return height > 0 ? height : 768;
 }
 
 // Check whether specified mode is available
@@ -734,7 +1111,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	if (flags & SDL_WINDOW_FULLSCREEN) {
 		SDL_DisplayMode desktop_mode;
 		if (SDL_GetDesktopDisplayMode(0, &desktop_mode) != 0) {
-			shutdown_sdl_video();
+			fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
 			return NULL;
 		}
 		window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
@@ -758,11 +1135,20 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, PrefsFindBool("scale_nearest") ? "nearest" : "linear");
 	
 #if defined(__MACOSX__) && SDL_VERSION_ATLEAST(2,0,14)
-	if (MetalIsAvailable()) window_flags |= SDL_WINDOW_METAL;
+	// SDL's offscreen driver (scripted runs) has neither Metal nor OpenGL: its software renderer.
+	const bool offscreen = SDL_GetCurrentVideoDriver() && !strcmp(SDL_GetCurrentVideoDriver(), "offscreen");
+	if (MetalIsAvailable() && !offscreen) window_flags |= SDL_WINDOW_METAL;
 #endif
 	
 	if (!sdl_window) {
 		float m = get_mag_rate();
+#ifdef __ANDROID__
+		// GLSL ES 3.00 for the upscaling shaders; SDL's GLES2 renderer keeps
+		// an ES context of version 2 or later as it is asked for.
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
 		sdl_window = SDL_CreateWindow(
 			"",
 			SDL_WINDOWPOS_UNDEFINED,
@@ -771,7 +1157,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 			m * window_height,
 			window_flags);
 		if (!sdl_window) {
-			shutdown_sdl_video();
+			fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
 			return NULL;
 		}
 		set_window_name();
@@ -795,7 +1181,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 #ifdef WIN32
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
 #elif defined(__MACOSX__) && SDL_VERSION_ATLEAST(2,0,14)
-			SDL_SetHint(SDL_HINT_RENDER_DRIVER, window_flags & SDL_WINDOW_METAL ? "metal" : "opengl");
+			SDL_SetHint(SDL_HINT_RENDER_DRIVER, offscreen ? "software" : window_flags & SDL_WINDOW_METAL ? "metal" : "opengl");
 #else
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");
 #endif
@@ -807,9 +1193,12 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 		}
 
 		sdl_renderer = SDL_CreateRenderer(sdl_window, -1, 0);
+#ifdef __ANDROID__
+		upscale_generation++;
+#endif
 
 		if (!sdl_renderer) {
-			shutdown_sdl_video();
+			fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
 			return NULL;
 		}
 		sdl_renderer_thread_id = SDL_ThreadID();
@@ -831,7 +1220,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_BGRA8888, SDL_TEXTUREACCESS_STREAMING, width, height);
 #endif
     if (!sdl_texture) {
-        shutdown_sdl_video();
+        fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
         return NULL;
     }
     sdl_update_video_rect.x = 0;
@@ -870,7 +1259,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
             break;
     }
     if (!guest_surface) {
-        shutdown_sdl_video();
+        fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
         return NULL;
     }
 
@@ -878,7 +1267,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
     	Uint32 texture_format;
     	if (SDL_QueryTexture(sdl_texture, &texture_format, NULL, NULL, NULL) != 0) {
     		printf("ERROR: Unable to get the SDL texture's pixel format: %s\n", SDL_GetError());
-    		shutdown_sdl_video();
+    		fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
     		return NULL;
     	}
 
@@ -886,14 +1275,14 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
     	Uint32 Rmask, Gmask, Bmask, Amask;
     	if (!SDL_PixelFormatEnumToMasks(texture_format, &bpp, &Rmask, &Gmask, &Bmask, &Amask)) {
     		printf("ERROR: Unable to determine format for host SDL_surface: %s\n", SDL_GetError());
-    		shutdown_sdl_video();
+    		fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
     		return NULL;
     	}
 
         host_surface = SDL_CreateRGBSurface(0, width, height, bpp, Rmask, Gmask, Bmask, Amask);
         if (!host_surface) {
         	printf("ERROR: Unable to create host SDL_surface: %s\n", SDL_GetError());
-            shutdown_sdl_video();
+            fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
             return NULL;
         }
     }
@@ -901,7 +1290,7 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
 	if (SDL_RenderSetLogicalSize(sdl_renderer, width, height) != 0) {
 		printf("ERROR: Unable to set SDL rendeer's logical size (to %dx%d): %s\n",
 			   width, height, SDL_GetError());
-		shutdown_sdl_video();
+		fprintf(stderr, "init_sdl_video line %d: %s\n", __LINE__, SDL_GetError()); shutdown_sdl_video();
 		return NULL;
 	}
 
@@ -910,8 +1299,72 @@ static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flag
     return guest_surface;
 }
 
+
+#ifndef __ANDROID__
+/*
+ *  Debugging hooks for driving the Mac from a script (carmen-mac branch):
+ *  SS_DUMP=path   the Mac's screen is saved there as BMP about once a second
+ *                 (written to path.tmp, then renamed);
+ *  SS_INPUT=path  a FIFO of lines: "move X Y", "down", "up", "key CODE"
+ *                 (a Mac key code, pressed and released), "keydown CODE",
+ *                 "keyup CODE".
+ */
+#include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
+static void *ss_input_func(void *arg)
+{
+	const char *path = (const char *)arg;
+	for (;;) {
+		FILE *f = fopen(path, "r");
+		if (!f) { sleep(1); continue; }
+		char line[128];
+		while (fgets(line, sizeof(line), f)) {
+			int a = 0, b = 0;
+			if (sscanf(line, "move %d %d", &a, &b) == 2) ADBMouseMoved(a, b);
+			else if (!strncmp(line, "down", 4)) ADBMouseDown(0);
+			else if (!strncmp(line, "up", 2)) ADBMouseUp(0);
+			else if (sscanf(line, "keydown %d", &a) == 1) ADBKeyDown(a);
+			else if (sscanf(line, "keyup %d", &a) == 1) ADBKeyUp(a);
+			else if (sscanf(line, "key %d", &a) == 1) { ADBKeyDown(a); usleep(80000); ADBKeyUp(a); }
+		}
+		fclose(f);
+	}
+	return NULL;
+}
+
+static void ss_debug_hooks(SDL_Surface *surface)
+{
+	static bool started;
+	if (!started) {
+		started = true;
+		const char *in = getenv("SS_INPUT");
+		if (in) { pthread_t t; pthread_create(&t, NULL, ss_input_func, (void *)in); pthread_detach(t); }
+	}
+	const char *dump = getenv("SS_DUMP");
+	// SS_DUMP_MS: milliseconds between dumps, 1000 when unset. A script that
+	// reads what the pointer is over needs the screen sooner than a second on.
+	static Uint32 last, every;
+	if (!every) {
+		const char *ms = getenv("SS_DUMP_MS");
+		every = ms && atoi(ms) > 0 ? atoi(ms) : 1000;
+	}
+	if (dump && surface && SDL_GetTicks() - last >= every) {
+		last = SDL_GetTicks();
+		std::string tmp = std::string(dump) + ".tmp";
+		// 16-bit surfaces do not save as BMP; those are converted to 24-bit first.
+		SDL_Surface *out = surface->format->BitsPerPixel == 16 ? SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_RGB24, 0) : surface;
+		if (out && SDL_SaveBMP(out, tmp.c_str()) == 0) rename(tmp.c_str(), dump);
+		if (out && out != surface) SDL_FreeSurface(out);
+	}
+}
+#endif
+
 static int present_sdl_video()
 {
+#ifndef __ANDROID__
+	ss_debug_hooks(guest_surface);
+#endif
 	if (SDL_RectEmpty(&sdl_update_video_rect)) return 0;
 	
 	if (!sdl_renderer || !sdl_texture || !guest_surface) {
@@ -931,6 +1384,9 @@ static int present_sdl_video()
 	// cleared.  Not doing so can, if and when letterboxing is applied (whereby
 	// colored bars are drawn on the screen's sides to help with aspect-ratio
 	// correction), the colored bars can be an unknown color.
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: new frame from the Mac");
+#endif
 	SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 0);	// Use black
 	SDL_RenderClear(sdl_renderer);						// Clear the display
 	
@@ -960,6 +1416,9 @@ static int present_sdl_video()
 
 	uint8_t *dstPixels;
 	int dstPitch;
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: updating SDL's texture");
+#endif
 	if (SDL_LockTexture(sdl_texture, &sdl_update_video_rect, (void **)&dstPixels, &dstPitch) < 0) {
 		SDL_UnlockMutex(sdl_update_video_mutex);
 		return -1;
@@ -970,6 +1429,9 @@ static int present_sdl_video()
 		dstPixels += dstPitch;
 	}
 	SDL_UnlockTexture(sdl_texture);
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: SDL's texture updated");
+#endif
 
     // We are done working with pixels in host_surface.  Reset sdl_update_video_rect, then let
     // other threads modify it, as-needed.
@@ -980,12 +1442,29 @@ static int present_sdl_video()
     SDL_UnlockMutex(sdl_update_video_mutex);
 
     // Copy the texture to the display
+#ifdef __ANDROID__
+	if (!upscale_present(sdl_texture, guest_surface->w, guest_surface->h))
+#endif
     if (SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL) != 0) {
 		return -1;
 	}
 	
     // Update the display
 	SDL_RenderPresent(sdl_renderer);
+#ifndef __ANDROID__
+	// Frames presented, every ten seconds, to compare with the Board's [present] lines.
+	static Uint32 present_since = SDL_GetTicks();
+	static int present_count;
+	present_count++;
+	if (SDL_GetTicks() - present_since >= 10000) {
+		printf("[present] %d frames in %.1f s\n", present_count, (SDL_GetTicks() - present_since) / 1000.0);
+		fflush(stdout);
+		present_since = SDL_GetTicks(); present_count = 0;
+	}
+#endif
+#ifdef __ANDROID__
+	if (upscale_trace) upscale_log("[upscale] step: presented");
+#endif
     
     // Indicate success to the caller!
     return 0;
@@ -1414,11 +1893,11 @@ bool VideoInit(bool classic)
 
 	// Create Mutexes
 	if ((sdl_events_lock = SDL_CreateMutex()) == NULL)
-		return false;
+		{ fprintf(stderr, "VideoInit failed at 1: %s\n", SDL_GetError()); return false; }
 	if ((sdl_palette_lock = SDL_CreateMutex()) == NULL)
-		return false;
+		{ fprintf(stderr, "VideoInit failed at 2: %s\n", SDL_GetError()); return false; }
 	if ((frame_buffer_lock = SDL_CreateMutex()) == NULL)
-		return false;
+		{ fprintf(stderr, "VideoInit failed at 3: %s\n", SDL_GetError()); return false; }
 
 	// Init keycode translation
 	keycode_init();
@@ -1528,7 +2007,7 @@ bool VideoInit(bool classic)
 			for (int i = 0; video_modes[i].w != 0; i++) {
 				const int w = video_modes[i].w;
 				const int h = video_modes[i].h;
-				if (i > 0 && (w >= default_width || h >= default_height))
+				if (i > 0 && (PrefsFindBool("singlemode") || w >= default_width || h >= default_height))
 					continue;
 				for (int d = VIDEO_DEPTH_1BIT; d <= default_depth; d++)
 					add_mode(display_type, w, h, video_modes[i].resolution_id, TrivialBytesPerRow(w, (video_depth)d), d);
@@ -1538,7 +2017,7 @@ bool VideoInit(bool classic)
 		for (int i = 0; video_modes[i].w != 0; i++) {
 			const int w = video_modes[i].w;
 			const int h = video_modes[i].h;
-			if (i > 0 && (w >= default_width || h >= default_height))
+			if (i > 0 && (PrefsFindBool("singlemode") || w >= default_width || h >= default_height))
 				continue;
 			for (int d = VIDEO_DEPTH_1BIT; d <= default_depth; d++)
 				add_mode(display_type, w, h, video_modes[i].resolution_id, TrivialBytesPerRow(w, (video_depth)d), d);
@@ -1547,7 +2026,7 @@ bool VideoInit(bool classic)
 
 	if (VideoModes.empty()) {
 		ErrorAlert(STR_NO_XVISUAL_ERR);
-		return false;
+		{ fprintf(stderr, "VideoInit failed at 4: %s\n", SDL_GetError()); return false; }
 	}
 
 	// Find requested default mode with specified dimensions
@@ -1606,7 +2085,9 @@ bool VideoInit(bool classic)
 	VideoMonitors.push_back(monitor);
 
 	// Open display
-	return monitor->video_open();
+	bool opened = monitor->video_open();
+	if (!opened) fprintf(stderr, "video_open failed: %s\n", SDL_GetError());
+	return opened;
 }
 
 

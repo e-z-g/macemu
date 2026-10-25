@@ -1217,8 +1217,25 @@ quit:
  *  Cleanup and quit
  */
 
+#ifdef __ANDROID__
+#include <jni.h>
+// Set when the Mac has gone off (or SheepShaver stops for any reason). The
+// Board app asks for it and ends the process itself: tearing SDL down from
+// here has hung there. PRAM is saved first; the disks' writes are already
+// the kernel's.
+static volatile bool mac_off;
+extern "C" JNIEXPORT jboolean JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeMacOff(JNIEnv *, jclass)
+{
+	return mac_off;
+}
+#endif
+
 static void Quit(void)
 {
+#ifdef __ANDROID__
+	SaveXPRAM();
+	mac_off = true;
+#endif
 #if EMULATED_PPC
 	// Exit PowerPC emulation
 	exit_emul_ppc();
@@ -1227,14 +1244,18 @@ static void Quit(void)
 	// Stop 60Hz thread
 	if (tick_thread_active) {
 		tick_thread_cancel = true;
-		pthread_cancel(tick_thread);
+#ifndef __ANDROID__
+		pthread_cancel(tick_thread);	// Android's libc has none; the thread checks tick_thread_cancel
+#endif
 		pthread_join(tick_thread, NULL);
 	}
 
 	// Stop NVRAM watchdog thread
 	if (nvram_thread_active) {
 		nvram_thread_cancel = true;
-		pthread_cancel(nvram_thread);
+#ifndef __ANDROID__
+		pthread_cancel(nvram_thread);	// Android's libc has none; the thread checks nvram_thread_cancel
+#endif
 		pthread_join(nvram_thread, NULL);
 	}
 
