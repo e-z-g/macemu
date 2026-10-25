@@ -212,7 +212,7 @@ static int present_sdl_video();
 #include <map>
 #include <mutex>
 #include <android/log.h>
-#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "CarmenSS", __VA_ARGS__)
+#define upscale_log(...) __android_log_print(ANDROID_LOG_INFO, "SheepShaver", __VA_ARGS__)
 #include <pthread.h>
 #include <unistd.h>
 
@@ -246,12 +246,22 @@ __attribute__((constructor)) static void stdout_to_log()
 // describes them; the app's Upscaler.java picks and expands them).
 static std::mutex upscale_lock;
 static std::string upscale_spec = "sharp-bilinear.glsl:linear";
-extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_carmenss_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_sheepboard_MainActivity_nativeSetFilter(JNIEnv *env, jclass, jstring spec)
 {
 	const char *c = env->GetStringUTFChars(spec, NULL);
 	std::lock_guard<std::mutex> g(upscale_lock);
 	upscale_spec = c;
 	env->ReleaseStringUTFChars(spec, c);
+}
+
+// A magnifier over the picture (lens.glsl), set from Java (PieceStick's zoom
+// piece): centre X, Y and radius in display pixels (Y down, as touches), and
+// the zoom; a radius of 0 is none.
+static float upscale_lens[4];
+extern "C" JNIEXPORT void JNICALL Java_io_github_ratlizard_sheepboard_MainActivity_nativeSetLens(JNIEnv *, jclass, jfloat x, jfloat y, jfloat r, jfloat zoom)
+{
+	std::lock_guard<std::mutex> g(upscale_lock);
+	upscale_lens[0] = x; upscale_lens[1] = y; upscale_lens[2] = r; upscale_lens[3] = zoom;
 }
 
 struct UpscalePass { std::string file; bool nearest, half; int mult; };
@@ -468,11 +478,14 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 			std::string file = list.substr(b == std::string::npos ? 0 : b + 1, at + 5 - (b == std::string::npos ? 0 : b + 1));
 			if (upscale_programs.find(file) == upscale_programs.end()) { upscale_program(file.c_str(), ""); count++; }
 		}
+		upscale_program("lens.glsl", "");
 		upscale_log("[upscale] %d shaders compiled in %u ms", count, SDL_GetTicks() - t0);
 	}
+	float lens[4];
 	{
 		std::lock_guard<std::mutex> g(upscale_lock);
 		if (upscale_spec != upscale_parsed) { upscale_parse(upscale_spec); upscale_trace = 2; }
+		memcpy(lens, upscale_lens, sizeof(lens));
 	}
 #define UPSCALE_STEP(...) do { if (upscale_trace) { upscale_log("[upscale] step: " __VA_ARGS__); glFinish(); upscale_log("[upscale] (finished)"); } } while (0)
 	if (upscale_trace) upscale_log("[upscale] step: start of frame");
@@ -524,6 +537,8 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 	SDL_GL_UnbindTexture(texture);
 	UPSCALE_STEP("copied, GL error 0x%x", glGetError());
 
+	// With a lens, the last pass draws into a target of the picture's size, and lens.glsl draws that on screen.
+	GLuint lens_prog = lens[2] > 0 ? upscale_program("lens.glsl", "") : 0;
 	std::vector<UpscaleTarget> outs(1, orig);
 	for (size_t k = 0; k < upscale_chain.size(); k++) {
 		const UpscalePass &pass = upscale_chain[k];
@@ -533,7 +548,9 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 		bool last = k + 1 == upscale_chain.size();
 		int ow = last || !pass.mult ? vw : in.w * pass.mult, oh = last || !pass.mult ? vh : in.h * pass.mult;
 		UpscaleTarget out = {0, ow, oh, false};
-		if (last) {
+		if (last && lens_prog) {
+			out = upscale_target(k + 1, ow, oh, false);
+		} else if (last) {
 			glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
 			glViewport(vx, vy, vw, vh);
 		} else {
@@ -556,6 +573,22 @@ static bool upscale_present(SDL_Texture *texture, int w, int h)
 		glActiveTexture(GL_TEXTURE0);
 		upscale_sampling(GL_NEAREST);
 		outs.push_back(out);
+	}
+	if (lens_prog && !upscale_failed) {
+		const UpscaleTarget &pic = outs.back();
+		glBindFramebuffer(GL_FRAMEBUFFER, screen_fb);
+		glViewport(vx, vy, vw, vh);
+		glUseProgram(lens_prog);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, pic.tex);
+		upscale_sampling(GL_LINEAR);
+		glUniform1i(glGetUniformLocation(lens_prog, "Texture"), 0);
+		glUniform2f(glGetUniformLocation(lens_prog, "Size"), vw, vh);
+		glUniform2f(glGetUniformLocation(lens_prog, "Center"), lens[0] - vx, (dh - lens[1]) - vy);
+		glUniform1f(glGetUniformLocation(lens_prog, "Radius"), lens[2]);
+		glUniform1f(glGetUniformLocation(lens_prog, "Zoom"), lens[3]);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		upscale_sampling(GL_NEAREST);
 	}
 	if (upscale_trace) upscale_trace--;
 	// Frames drawn per second, over each ten seconds.
@@ -1360,12 +1393,39 @@ static void ss_debug_hooks(SDL_Surface *surface)
 }
 #endif
 
+#ifdef __ANDROID__
+// Time spent presenting, on the emulator's thread (VideoVBL), logged every ten seconds:
+// converting the Mac's pixels, uploading them, and the filter passes with the present.
+static Uint64 present_since, present_convert, present_upload, present_draw, present_area;
+static int present_count;
+static void present_note(Uint64 t0, Uint64 t1, Uint64 t2, Uint64 t3, int area)
+{
+	Uint64 now = SDL_GetPerformanceCounter(), f = SDL_GetPerformanceFrequency();
+	if (!present_since) present_since = now;
+	present_convert += t1 - t0; present_upload += t2 - t1; present_draw += t3 - t2;
+	present_area += area; present_count++;
+	if (now - present_since >= 10 * f) {
+		double ms = 1000.0 / f, n = present_count;
+		upscale_log("[present] %d frames in %.1f s, each %.1f ms (convert %.1f, upload %.1f, filter and present %.1f), %.0f%% of the emulator's time, changed area %.0f%% of the screen",
+			present_count, (now - present_since) * ms / 1000, (present_convert + present_upload + present_draw) * ms / n,
+			present_convert * ms / n, present_upload * ms / n, present_draw * ms / n,
+			100.0 * (present_convert + present_upload + present_draw) / (now - present_since),
+			100.0 * present_area / n / (guest_surface->w * guest_surface->h));
+		present_since = now; present_convert = present_upload = present_draw = present_area = 0; present_count = 0;
+	}
+}
+#endif
+
 static int present_sdl_video()
 {
 #ifndef __ANDROID__
 	ss_debug_hooks(guest_surface);
 #endif
 	if (SDL_RectEmpty(&sdl_update_video_rect)) return 0;
+#ifdef __ANDROID__
+	Uint64 t0 = SDL_GetPerformanceCounter(), t1, t2;
+	int area = sdl_update_video_rect.w * sdl_update_video_rect.h;
+#endif
 	
 	if (!sdl_renderer || !sdl_texture || !guest_surface) {
 		printf("WARNING: A video mode does not appear to have been set.\n");
@@ -1408,6 +1468,9 @@ static int present_sdl_video()
 		}
 	}
 	UNLOCK_PALETTE; // passed potential deadlock, can unlock palette
+#ifdef __ANDROID__
+	t1 = SDL_GetPerformanceCounter();
+#endif
 	
     // Update the host OS' texture
 	uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
@@ -1430,6 +1493,7 @@ static int present_sdl_video()
 	}
 	SDL_UnlockTexture(sdl_texture);
 #ifdef __ANDROID__
+	t2 = SDL_GetPerformanceCounter();
 	if (upscale_trace) upscale_log("[upscale] step: SDL's texture updated");
 #endif
 
@@ -1464,6 +1528,7 @@ static int present_sdl_video()
 #endif
 #ifdef __ANDROID__
 	if (upscale_trace) upscale_log("[upscale] step: presented");
+	present_note(t0, t1, t2, SDL_GetPerformanceCounter(), area);
 #endif
     
     // Indicate success to the caller!
@@ -2884,6 +2949,7 @@ static void handle_events(void)
 					code = keycode_table[event.key.keysym.scancode & 0xff];
 				if (code == CODE_INVALID)
 					code = event2keycode(event.key, true);
+				printf("[key] down: SDL key %d, Mac code %d\n", (int)event.key.keysym.sym, code);
 				if (code >= 0) {
 					if (!emul_suspended) {
 						code = modify_opt_cmd(code);
@@ -2942,6 +3008,7 @@ static void handle_events(void)
 
 			// Window "close" widget clicked
 			case SDL_QUIT:
+				printf("[quit] SDL_QUIT: the power key\n");
 				if (SDL_GetModState() & (KMOD_LALT | KMOD_RALT)) break;
 				ADBKeyDown(0x7f);	// Power key
 				ADBKeyUp(0x7f);
